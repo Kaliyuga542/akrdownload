@@ -1,0 +1,4 @@
+python-telegram-bot==22.3
+aiohttp==3.12.15
+m3u8==6.0.0
+python-dotenv==1.1.1
