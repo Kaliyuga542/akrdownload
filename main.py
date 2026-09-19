@@ -1398,12 +1398,11 @@ async def run_bot():
     application.add_handler(
         MessageHandler(
             filters.Document.FileExtension(
-                "srt",
-                "vtt"
+                "srt|vtt"
             ),
             receive_subtitle
         )
-    )
+    )        
 
     # =====================================================
     # COOKIES
@@ -1412,14 +1411,11 @@ async def run_bot():
     application.add_handler(
         MessageHandler(
             filters.Document.FileExtension(
-                "txt",
-                "cookies",
-                "json"
+                "txt|cookies|json"
             ),
             receive_cookie_file
         )
     )
-
 
     # =====================================================
     # URL
