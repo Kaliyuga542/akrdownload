@@ -1391,35 +1391,36 @@ async def run_bot():
         )
     )
 
+    # =====================================================
+    # SUBTITLE
+    # =====================================================
+
+    application.add_handler(
+        MessageHandler(
+            filters.Document.FileExtension(
+                "srt",
+                "vtt"
+            ),
+            receive_subtitle
+        )
+    )
 
     # =====================================================
-# SUBTITLE
-# =====================================================
+    # COOKIES
+    # =====================================================
 
-application.add_handler(
-    MessageHandler(
-        filters.Document.FileExtension(
-            "srt",
-            "vtt"
-        ),
-        receive_subtitle
+    application.add_handler(
+        MessageHandler(
+            filters.Document.FileExtension(
+                "txt",
+                "cookies",
+                "json"
+            ),
+            receive_cookie_file
+        )
     )
-)
 
-# =====================================================
-# COOKIES
-# =====================================================
 
-application.add_handler(
-    MessageHandler(
-        filters.Document.FileExtension(
-            "txt",
-            "cookies",
-            "json"
-        ),
-        receive_cookie_file
-    )
-)
     # =====================================================
     # URL
     # =====================================================
@@ -1430,8 +1431,7 @@ application.add_handler(
             receive_url
         )
     )
-
-
+    
     # =====================================================
     # ERROR
     # =====================================================
