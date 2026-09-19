@@ -4,6 +4,12 @@ from telegram.ext import ContextTypes
 
 from config import validate_config
 
+from bot.cookie_manager import (
+    save_cookie_file,
+    basic_cookie_check,
+    delete_cookie_file,
+)
+
 
 async def start_handler(
     update: Update,
@@ -67,3 +73,42 @@ async def unknown_handler(
         "❓ Unknown command.\n\n"
         "Send an authorized .m3u8 URL or use /help."
     )
+
+async def receive_cookie_file(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user_id = update.effective_user.id
+    document = update.message.document
+
+    try:
+        path = await save_cookie_file(
+            document,
+            user_id,
+            context.bot
+        )
+
+        if not basic_cookie_check(path):
+            delete_cookie_file(user_id)
+
+            await update.message.reply_text(
+                "❌ Invalid cookie file."
+            )
+            return
+
+        await update.message.reply_text(
+            "✅ Cookie file received.\n\n"
+            "🔐 Authorized session validation required."
+        )
+
+    except ValueError as e:
+        await update.message.reply_text(
+            f"❌ {e}"
+        )
+
+    except Exception as e:
+        print(f"Cookie upload error: {e}")
+
+        await update.message.reply_text(
+            "❌ Cookie file process failed."
+        )
