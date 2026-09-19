@@ -429,9 +429,36 @@ async def receive_url(
 
     except Exception as error:
 
+    error_text = str(error)
+
+    if "403" in error_text or "Forbidden" in error_text:
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "🍪 Upload Cookies",
+                    callback_data="upload_cookies"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ Cancel",
+                    callback_data="cancel_analysis"
+                )
+            ]
+        ]
+
+        await status.edit_text(
+            "❌ Playlist access denied (403).\n\n"
+            "🍪 Upload an authorized cookie file to continue.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    else:
+
         await status.edit_text(
             "❌ Playlist analysis failed.\n\n"
-            f"{str(error)[:3000]}"
+            f"{error_text[:3000]}"
         )
 
 
@@ -464,6 +491,19 @@ async def callback(
         return
 
     data = query.data
+
+    if data == "upload_cookies":
+    await query.answer()
+
+    await query.message.reply_text(
+        "🍪 Please send your authorized cookie file.\n\n"
+        "Supported:\n"
+        "• .txt\n"
+        "• .cookies\n"
+        "• .json"
+    )
+
+    return
 
 
     # =====================================================
@@ -1342,7 +1382,28 @@ async def start_health_server():
 # =========================================================
 # TELEGRAM BOT
 # =========================================================
+async def receive_document(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    document = update.message.document
 
+    filename = (document.file_name or "").lower()
+
+    if filename.endswith((".srt", ".vtt")):
+        await receive_subtitle(update, context)
+        return
+
+    if filename.endswith((".txt", ".cookies", ".json")):
+        await receive_cookie_file(update, context)
+        return
+
+    await update.message.reply_text(
+        "❌ Unsupported file.\n\n"
+        "Subtitle: .srt / .vtt\n"
+        "Cookie file: .txt / .cookies / .json"
+    )
+    
 async def run_bot():
 
     validate_config()
