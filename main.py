@@ -29,7 +29,7 @@ from config import (
 
 from bot.hls import analyse as analyse_hls
 from bot.dash import analyse as analyse_dash
-
+from bot.handlers import receive_cookie_file
 from bot.uploader import upload_to_gofile
 from bot.processor import merge_video_audio
 
@@ -1393,17 +1393,33 @@ async def run_bot():
 
 
     # =====================================================
-    # SUBTITLE
-    # =====================================================
+# SUBTITLE
+# =====================================================
 
-    application.add_handler(
-        MessageHandler(
-            filters.Document.ALL,
-            receive_subtitle
-        )
+application.add_handler(
+    MessageHandler(
+        filters.Document.FileExtension(
+            "srt",
+            "vtt"
+        ),
+        receive_subtitle
     )
+)
 
+# =====================================================
+# COOKIES
+# =====================================================
 
+application.add_handler(
+    MessageHandler(
+        filters.Document.FileExtension(
+            "txt",
+            "cookies",
+            "json"
+        ),
+        receive_cookie_file
+    )
+)
     # =====================================================
     # URL
     # =====================================================
