@@ -1353,12 +1353,9 @@ async def run_bot():
         .token(BOT_TOKEN)
         .build()
     )
-
-
     # =====================================================
     # COMMANDS
     # =====================================================
-
     application.add_handler(
         CommandHandler(
             "start",
@@ -1379,22 +1376,17 @@ async def run_bot():
             cancel
         )
     )
-
-
     # =====================================================
     # CALLBACKS
     # =====================================================
-
     application.add_handler(
         CallbackQueryHandler(
             callback
         )
     )
-
     # =====================================================
     # SUBTITLE
     # =====================================================
-
     application.add_handler(
         MessageHandler(
             filters.Document.FileExtension(
@@ -1403,11 +1395,9 @@ async def run_bot():
             receive_subtitle
         )
     )        
-
     # =====================================================
     # COOKIES
     # =====================================================
-
     application.add_handler(
         MessageHandler(
             filters.Document.FileExtension(
@@ -1416,18 +1406,15 @@ async def run_bot():
             receive_cookie_file
         )
     )
-
     # =====================================================
     # URL
     # =====================================================
-
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             receive_url
         )
     )
-    
     # =====================================================
     # ERROR
     # =====================================================
