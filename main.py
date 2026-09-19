@@ -428,38 +428,35 @@ async def receive_url(
         )
 
     except Exception as error:
-
-    error_text = str(error)
-
-    if "403" in error_text or "Forbidden" in error_text:
-
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "🍪 Upload Cookies",
-                    callback_data="upload_cookies"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "❌ Cancel",
-                    callback_data="cancel_analysis"
-                )
+        error_text = str(error)
+        if "403" in error_text or "Forbidden" in error_text:
+            keyboard = [
+                [
+                    InlineKeyboardButton(
+                        "🍪 Upload Cookies",
+                        callback_data="upload_cookies"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "❌ Cancel",
+                        callback_data="cancel_analysis"
+                    )
+                ]
             ]
-        ]
-
-        await status.edit_text(
-            "❌ Playlist access denied (403).\n\n"
-            "🍪 Upload an authorized cookie file to continue.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-
-    else:
-
-        await status.edit_text(
-            "❌ Playlist analysis failed.\n\n"
-            f"{error_text[:3000]}"
-        )
+            
+            await status.edit_text(
+                "❌ Playlist access denied (403).\n\n"
+                "🍪 Upload an authorized cookie file to continue.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        
+        else:
+            
+            await status.edit_text(
+                "❌ Playlist analysis failed.\n\n"
+                f"{error_text[:3000]}"
+            )
 
 
 # =========================================================
