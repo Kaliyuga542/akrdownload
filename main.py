@@ -2,6 +2,7 @@ import asyncio
 import shutil
 import tempfile
 from pathlib import Path
+from aiohttp import web
 
 import aiohttp
 
@@ -1231,6 +1232,43 @@ async def error_handler(
         repr(context.error)
     )
 
+async def health_handler(request):
+    return web.Response(
+        text="OK",
+        status=200
+    )
+
+
+async def start_health_server():
+    app = web.Application()
+
+    app.router.add_get(
+        "/",
+        health_handler
+    )
+
+    app.router.add_get(
+        "/health",
+        health_handler
+    )
+
+    runner = web.AppRunner(app)
+
+    await runner.setup()
+
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        8000
+    )
+
+    await site.start()
+
+    print(
+        "❤️ Health server running on port 8000"
+    )
+
+    return runner
 
 # =========================================================
 # MAIN
@@ -1325,5 +1363,19 @@ def main():
 # ENTRY POINT
 # =========================================================
 
+    # Keep bot alive
+    await asyncio.Event().wait()
+
+
+async def main():
+
+    await start_health_server()
+
+    await run_bot()
+
+
 if __name__ == "__main__":
-    main()
+
+    asyncio.run(
+        main()
+    )
