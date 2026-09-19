@@ -488,19 +488,18 @@ async def callback(
         return
 
     data = query.data
-
+    
     if data == "upload_cookies":
-    await query.answer()
-
-    await query.message.reply_text(
-        "🍪 Please send your authorized cookie file.\n\n"
-        "Supported:\n"
-        "• .txt\n"
-        "• .cookies\n"
-        "• .json"
-    )
-
-    return
+        await query.answer()
+        
+        await query.message.reply_text(
+            "🍪 Please send your authorized cookie file.\n\n"
+            "Supported:\n"
+            "• .txt\n"
+            "• .cookies\n"
+            "• .json"
+        )
+        return
 
 
     # =====================================================
