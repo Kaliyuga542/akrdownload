@@ -1,6 +1,7 @@
 import asyncio
 import shutil
 import tempfile
+import subprocess
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -115,12 +116,56 @@ async def download_file(
     url: str,
     destination: Path
 ):
-
     timeout = aiohttp.ClientTimeout(
         total=None,
         connect=30
     )
 
+    # HLS .m3u8 -> FFmpeg directly downloads
+    # the HLS segments and writes the media file.
+    if ".m3u8" in url.lower():
+
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            url,
+            "-map",
+            "0:v:0?",
+            "-map",
+            "0:a:0?",
+            "-c",
+            "copy",
+            str(destination)
+        ]
+
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        stdout, stderr = await process.communicate()
+
+        if process.returncode != 0:
+            raise RuntimeError(
+                "FFmpeg HLS download failed:\n"
+                + stderr.decode(errors="ignore")[-4000:]
+            )
+
+        if not destination.exists():
+            raise RuntimeError(
+                "FFmpeg did not create the output file."
+            )
+
+        if destination.stat().st_size == 0:
+            raise RuntimeError(
+                "Downloaded media file is empty."
+            )
+
+        return
+
+    # Normal files such as .srt / .vtt
     async with aiohttp.ClientSession(
         timeout=timeout
     ) as session:
@@ -134,7 +179,6 @@ async def download_file(
                 async for chunk in response.content.iter_chunked(
                     1024 * 1024
                 ):
-
                     file.write(chunk)
 
 
@@ -625,15 +669,20 @@ async def process_video(
 
     async with processing_semaphore:
 
-        workdir = Path(
-            tempfile.mkdtemp(
-                prefix="m3u8bot_"
-            )
+        if session.get("workdir"):
+    workdir = Path(
+        session["workdir"]
+    )
+else:
+    workdir = Path(
+        tempfile.mkdtemp(
+            prefix="m3u8bot_"
         )
+    )
 
-        session["workdir"] = str(
-            workdir
-        )
+session["workdir"] = str(
+    workdir
+)
 
         video_file = (
             workdir / "video.mp4"
