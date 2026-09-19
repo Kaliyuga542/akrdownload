@@ -1,17 +1,12 @@
-import os
 import asyncio
-import tempfile
 import shutil
+import tempfile
 from pathlib import Path
+from urllib.parse import urljoin
 
 import aiohttp
-import m3u8
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -21,586 +16,105 @@ from telegram.ext import (
     filters,
 )
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+from config import (
+    BOT_TOKEN,
+    MAX_TELEGRAM_SIZE,
+    validate_config,
+)
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN environment variable is missing")
+from bot.hls import analyse
+from bot.uploader import upload_to_gofile
+from bot.processor import merge_video_audio
 
-MAX_TELEGRAM_SIZE = int(1.94 * 1024 * 1024 * 1024)
+
+# =========================================================
+# USER SESSIONS
+# =========================================================
 
 sessions = {}
 
-
-# ---------------------------------------------------------
-# HLS
-# ---------------------------------------------------------
-
-async def get_text(url):
-    timeout = aiohttp.ClientTimeout(total=30)
-
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url) as response:
-            response.raise_for_status()
-            return await response.text()
+# Maximum number of simultaneous FFmpeg jobs
+processing_semaphore = asyncio.Semaphore(2)
 
 
-def absolute_url(base, uri):
-    from urllib.parse import urljoin
-    return urljoin(base, uri)
-
-
-async def analyse_hls(url):
-
-    text = await get_text(url)
-
-    playlist = m3u8.loads(text)
-
-    videos = []
-    audios = []
-    subtitles = []
-
-    # Master playlist
-    if playlist.is_variant:
-
-        for index, stream in enumerate(playlist.playlists):
-
-            info = stream.stream_info
-
-            videos.append({
-                "id": index,
-                "uri": absolute_url(url, stream.uri),
-                "bandwidth": info.bandwidth,
-                "resolution": info.resolution,
-                "name": (
-                    f"{info.resolution[0]}x{info.resolution[1]}"
-                    if info.resolution
-                    else "Unknown"
-                )
-            })
-
-        for index, media in enumerate(playlist.media):
-
-            if media.type == "AUDIO":
-
-                audios.append({
-                    "id": index,
-                    "uri": absolute_url(url, media.uri)
-                    if media.uri else None,
-                    "name": media.name or "Audio",
-                    "language": media.language or ""
-                })
-
-            elif media.type == "SUBTITLES":
-
-                subtitles.append({
-                    "id": index,
-                    "uri": absolute_url(url, media.uri)
-                    if media.uri else None,
-                    "name": media.name or "Subtitle",
-                    "language": media.language or ""
-                })
-
-    return videos, audios, subtitles
-
-
-# ---------------------------------------------------------
+# =========================================================
 # START
-# ---------------------------------------------------------
+# =========================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
+    validate_config()
+
     await update.message.reply_text(
         "🎬 HLS → MP4 Bot\n\n"
-        "Send an authorized .m3u8 URL."
+        "Send an authorized .m3u8 URL.\n\n"
+        "I will show:\n"
+        "🎥 Video quality\n"
+        "🔊 Audio quality\n"
+        "💬 Subtitle tracks\n\n"
+        "Then press ▶️ Continue."
     )
 
 
-# ---------------------------------------------------------
-# URL RECEIVED
-# ---------------------------------------------------------
+# =========================================================
+# HELP
+# =========================================================
 
-async def receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    url = update.message.text.strip()
-
-    if ".m3u8" not in url:
-        await update.message.reply_text(
-            "❌ Please send a valid HLS .m3u8 URL."
-        )
-        return
-
-    msg = await update.message.reply_text(
-        "🔍 Analysing HLS playlist..."
-    )
-
-    try:
-
-        videos, audios, subtitles = await analyse_hls(url)
-
-        if not videos:
-            await msg.edit_text(
-                "❌ No selectable video variants found."
-            )
-            return
-
-        user_id = update.effective_user.id
-
-        sessions[user_id] = {
-            "url": url,
-            "videos": videos,
-            "audios": audios,
-            "subtitles": subtitles,
-            "video": None,
-            "audio": None,
-            "subtitle": None,
-            "uploaded_subtitle": None,
-        }
-
-        buttons = []
-
-        for video in videos:
-
-            resolution = video["name"]
-
-            buttons.append([
-                InlineKeyboardButton(
-                    f"🎥 {resolution}",
-                    callback_data=f"video:{video['id']}"
-                )
-            ])
-
-        await msg.edit_text(
-            "🎥 Select video quality:",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-
-    except Exception as e:
-
-        await msg.edit_text(
-            f"❌ HLS analysis failed:\n{e}"
-        )
-
-
-# ---------------------------------------------------------
-# CALLBACK
-# ---------------------------------------------------------
-
-async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-
-    if user_id not in sessions:
-        await query.edit_message_text(
-            "❌ Session expired. Send the .m3u8 link again."
-        )
-        return
-
-    session = sessions[user_id]
-
-    data = query.data
-
-    # VIDEO
-    if data.startswith("video:"):
-
-        index = int(data.split(":")[1])
-
-        session["video"] = session["videos"][index]
-
-        audios = session["audios"]
-
-        if not audios:
-
-            await show_subtitles(query, session)
-            return
-
-        buttons = []
-
-        for audio in audios:
-
-            label = audio["name"]
-
-            if audio["language"]:
-                label += f" ({audio['language']})"
-
-            buttons.append([
-                InlineKeyboardButton(
-                    f"🔊 {label}",
-                    callback_data=f"audio:{audio['id']}"
-                )
-            ])
-
-        await query.edit_message_text(
-            "🔊 Select audio:",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-
-    # AUDIO
-    elif data.startswith("audio:"):
-
-        index = int(data.split(":")[1])
-
-        session["audio"] = session["audios"][index]
-
-        await show_subtitles(query, session)
-
-    # SUBTITLE
-    elif data.startswith("subtitle:"):
-
-        index = int(data.split(":")[1])
-
-        session["subtitle"] = session["subtitles"][index]
-
-        await show_continue(query)
-
-    # SKIP SUBTITLE
-    elif data == "subtitle_skip":
-
-        session["subtitle"] = None
-
-        await show_continue(query)
-
-    # CONTINUE
-    elif data == "continue":
-
-        await query.edit_message_text(
-            "⏳ Starting processing..."
-        )
-
-        asyncio.create_task(
-            process_video(
-                query.message.chat_id,
-                context,
-                user_id
-            )
-        )
-
-
-# ---------------------------------------------------------
-# SUBTITLES
-# ---------------------------------------------------------
-
-async def show_subtitles(query, session):
-
-    subtitles = session["subtitles"]
-
-    buttons = []
-
-    for subtitle in subtitles:
-
-        label = subtitle["name"]
-
-        if subtitle["language"]:
-            label += f" ({subtitle['language']})"
-
-        buttons.append([
-            InlineKeyboardButton(
-                f"💬 {label}",
-                callback_data=f"subtitle:{subtitle['id']}"
-            )
-        ])
-
-    buttons.append([
-        InlineKeyboardButton(
-            "📤 Upload subtitle",
-            callback_data="upload_info"
-        )
-    ])
-
-    buttons.append([
-        InlineKeyboardButton(
-            "⏭ Skip subtitle",
-            callback_data="subtitle_skip"
-        )
-    ])
-
-    await query.edit_message_text(
-        "💬 Select subtitle:",
-        reply_markup=InlineKeyboardMarkup(buttons)
+    await update.message.reply_text(
+        "📖 How to use\n\n"
+        "1️⃣ Send an authorized .m3u8 URL\n"
+        "2️⃣ Select video quality\n"
+        "3️⃣ Select audio\n"
+        "4️⃣ Select subtitle or upload .srt/.vtt\n"
+        "5️⃣ Press Continue\n"
+        "6️⃣ Bot creates the MP4\n\n"
+        "📦 File routing:\n"
+        "≤ 1.94 GB → Telegram\n"
+        "> 1.94 GB → GoFile"
     )
 
 
-async def show_continue(query):
+# =========================================================
+# CANCEL
+# =========================================================
 
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "▶️ Continue",
-                callback_data="continue"
-            )
-        ]
-    ])
-
-    await query.edit_message_text(
-        "✅ Subtitle selected.\n\n"
-        "Press Continue to start processing.",
-        reply_markup=keyboard
-    )
-
-
-# ---------------------------------------------------------
-# SUBTITLE UPLOAD
-# ---------------------------------------------------------
-
-async def receive_subtitle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     user_id = update.effective_user.id
 
-    if user_id not in sessions:
-        await update.message.reply_text(
-            "❌ Start again by sending the HLS URL."
-        )
-        return
+    session = sessions.pop(user_id, None)
 
-    document = update.message.document
+    if session:
 
-    if not document:
-        return
+        workdir = session.get("workdir")
 
-    filename = document.file_name or ""
-
-    if not filename.lower().endswith((".srt", ".vtt")):
-
-        await update.message.reply_text(
-            "❌ Upload only .srt or .vtt subtitle files."
-        )
-        return
-
-    workdir = Path(tempfile.mkdtemp())
-
-    subtitle_path = workdir / filename
-
-    telegram_file = await document.get_file()
-
-    await telegram_file.download_to_drive(
-        custom_path=str(subtitle_path)
-    )
-
-    sessions[user_id]["uploaded_subtitle"] = str(
-        subtitle_path
-    )
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "▶️ Continue",
-                callback_data="continue"
+        if workdir:
+            shutil.rmtree(
+                workdir,
+                ignore_errors=True
             )
-        ]
-    ])
 
     await update.message.reply_text(
-        "✅ Subtitle uploaded.\n\n"
-        "Press Continue.",
-        reply_markup=keyboard
+        "❌ Operation cancelled."
     )
 
 
-# ---------------------------------------------------------
-# PROCESS
-# ---------------------------------------------------------
+# =========================================================
+# DOWNLOAD HELPER
+# =========================================================
 
-async def process_video(chat_id, context, user_id):
-
-    session = sessions[user_id]
-
-    workdir = Path(tempfile.mkdtemp())
-
-    try:
-
-        video = session["video"]
-        audio = session["audio"]
-
-        video_url = video["uri"]
-
-        audio_url = (
-            audio["uri"]
-            if audio
-            else None
-        )
-
-        video_file = workdir / "video.mp4"
-        audio_file = workdir / "audio.m4a"
-        subtitle_file = None
-        output_file = workdir / "final.mp4"
-
-        await context.bot.send_message(
-            chat_id,
-            "⬇️ Downloading video..."
-        )
-
-        await download_file(
-            video_url,
-            video_file
-        )
-
-        if audio_url:
-
-            await context.bot.send_message(
-                chat_id,
-                "🔊 Downloading audio..."
-            )
-
-            await download_file(
-                audio_url,
-                audio_file
-            )
-
-        uploaded_subtitle = session.get(
-            "uploaded_subtitle"
-        )
-
-        selected_subtitle = session.get(
-            "subtitle"
-        )
-
-        if uploaded_subtitle:
-
-            subtitle_file = Path(
-                uploaded_subtitle
-            )
-
-        elif selected_subtitle:
-
-            subtitle_file = workdir / "subtitle.vtt"
-
-            await download_file(
-                selected_subtitle["uri"],
-                subtitle_file
-            )
-
-        await context.bot.send_message(
-            chat_id,
-            "🔧 Merging video, audio and subtitles..."
-        )
-
-        command = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(video_file)
-        ]
-
-        if audio_url:
-            command += [
-                "-i",
-                str(audio_file)
-            ]
-
-        if subtitle_file:
-            command += [
-                "-i",
-                str(subtitle_file)
-            ]
-
-        command += [
-            "-map",
-            "0:v:0"
-        ]
-
-        if audio_url:
-            command += [
-                "-map",
-                "1:a:0"
-            ]
-        else:
-            command += [
-                "-map",
-                "0:a?"
-            ]
-
-        if subtitle_file:
-
-            subtitle_index = 2 if audio_url else 1
-
-            command += [
-                "-map",
-                f"{subtitle_index}:0"
-            ]
-
-        command += [
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac"
-        ]
-
-        if subtitle_file:
-
-            command += [
-                "-c:s",
-                "mov_text"
-            ]
-
-        command += [
-            "-movflags",
-            "+faststart",
-            str(output_file)
-        ]
-
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-
-        stdout, stderr = await process.communicate()
-
-        if process.returncode != 0:
-
-            raise RuntimeError(
-                stderr.decode(errors="ignore")[-3000:]
-            )
-
-        size = output_file.stat().st_size
-
-        if size <= MAX_TELEGRAM_SIZE:
-
-            await context.bot.send_message(
-                chat_id,
-                "📤 Uploading to Telegram..."
-            )
-
-            with open(output_file, "rb") as f:
-
-                await context.bot.send_document(
-                    chat_id,
-                    document=f,
-                    caption="✅ MP4 ready"
-                )
-
-        else:
-
-            await context.bot.send_message(
-                chat_id,
-                "📦 File is larger than 1.94 GB.\n"
-                "GoFile upload integration should be configured here."
-            )
-
-    except Exception as e:
-
-        await context.bot.send_message(
-            chat_id,
-            f"❌ Processing failed:\n{e}"
-        )
-
-    finally:
-
-        shutil.rmtree(
-            workdir,
-            ignore_errors=True
-        )
-
-        sessions.pop(user_id, None)
-
-
-# ---------------------------------------------------------
-# DOWNLOAD
-# ---------------------------------------------------------
-
-async def download_file(url, destination):
+async def download_file(
+    url: str,
+    destination: Path
+):
 
     timeout = aiohttp.ClientTimeout(
         total=None,
@@ -615,53 +129,802 @@ async def download_file(url, destination):
 
             response.raise_for_status()
 
-            with open(destination, "wb") as f:
+            with open(destination, "wb") as file:
 
                 async for chunk in response.content.iter_chunked(
                     1024 * 1024
                 ):
 
-                    f.write(chunk)
+                    file.write(chunk)
 
 
-# ---------------------------------------------------------
+# =========================================================
+# RECEIVE M3U8
+# =========================================================
+
+async def receive_url(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    url = update.message.text.strip()
+
+    if ".m3u8" not in url.lower():
+
+        await update.message.reply_text(
+            "❌ Please send a valid .m3u8 URL."
+        )
+        return
+
+    user_id = update.effective_user.id
+
+    # Remove old session
+    old = sessions.pop(user_id, None)
+
+    if old and old.get("workdir"):
+
+        shutil.rmtree(
+            old["workdir"],
+            ignore_errors=True
+        )
+
+    status = await update.message.reply_text(
+        "🔍 Analysing HLS playlist..."
+    )
+
+    try:
+
+        videos, audios, subtitles = await analyse(url)
+
+        if not videos:
+
+            await status.edit_text(
+                "❌ No selectable video qualities found."
+            )
+            return
+
+        sessions[user_id] = {
+            "url": url,
+            "videos": videos,
+            "audios": audios,
+            "subtitles": subtitles,
+
+            "video": None,
+            "audio": None,
+            "subtitle": None,
+
+            "uploaded_subtitle": None,
+
+            "workdir": None,
+        }
+
+        buttons = []
+
+        for video in videos:
+
+            resolution = video.get("resolution")
+
+            if resolution:
+
+                label = (
+                    f"{resolution[0]}x"
+                    f"{resolution[1]}"
+                )
+
+            else:
+
+                bandwidth = video.get(
+                    "bandwidth",
+                    0
+                )
+
+                if bandwidth:
+                    label = (
+                        f"{bandwidth // 1000} kbps"
+                    )
+                else:
+                    label = "Unknown"
+
+            buttons.append([
+                __import__(
+                    "telegram"
+                ).InlineKeyboardButton(
+                    f"🎥 {label}",
+                    callback_data=f"video:{video['id']}"
+                )
+            ])
+
+        await status.edit_text(
+            "🎥 Select video quality:",
+            reply_markup=__import__(
+                "telegram"
+            ).InlineKeyboardMarkup(buttons)
+        )
+
+    except Exception as error:
+
+        await status.edit_text(
+            "❌ HLS analysis failed.\n\n"
+            f"{str(error)[:3000]}"
+        )
+
+
+# =========================================================
+# VIDEO / AUDIO / SUBTITLE CALLBACKS
+# =========================================================
+
+async def callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    user_id = query.from_user.id
+
+    session = sessions.get(user_id)
+
+    if not session:
+
+        await query.edit_message_text(
+            "❌ Session expired.\n"
+            "Please send the .m3u8 URL again."
+        )
+        return
+
+    data = query.data
+
+    # -----------------------------------------------------
+    # VIDEO
+    # -----------------------------------------------------
+
+    if data.startswith("video:"):
+
+        index = int(
+            data.split(":", 1)[1]
+        )
+
+        session["video"] = session[
+            "videos"
+        ][index]
+
+        audios = session["audios"]
+
+        # No audio tracks
+        if not audios:
+
+            await show_subtitles(
+                query,
+                session
+            )
+
+            return
+
+        buttons = []
+
+        for audio in audios:
+
+            name = audio.get(
+                "name"
+            ) or "Audio"
+
+            language = audio.get(
+                "language"
+            )
+
+            if language:
+                name += f" ({language})"
+
+            buttons.append([
+                __import__(
+                    "telegram"
+                ).InlineKeyboardButton(
+                    f"🔊 {name}",
+                    callback_data=f"audio:{audio['id']}"
+                )
+            ])
+
+        await query.edit_message_text(
+            "🔊 Select audio:",
+            reply_markup=__import__(
+                "telegram"
+            ).InlineKeyboardMarkup(buttons)
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # AUDIO
+    # -----------------------------------------------------
+
+    if data.startswith("audio:"):
+
+        index = int(
+            data.split(":", 1)[1]
+        )
+
+        session["audio"] = session[
+            "audios"
+        ][index]
+
+        await show_subtitles(
+            query,
+            session
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # SUBTITLE
+    # -----------------------------------------------------
+
+    if data.startswith("subtitle:"):
+
+        index = int(
+            data.split(":", 1)[1]
+        )
+
+        session["subtitle"] = session[
+            "subtitles"
+        ][index]
+
+        await show_continue(
+            query
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # SKIP SUBTITLE
+    # -----------------------------------------------------
+
+    if data == "subtitle_skip":
+
+        session["subtitle"] = None
+
+        await show_continue(
+            query
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # UPLOAD SUBTITLE
+    # -----------------------------------------------------
+
+    if data == "upload_info":
+
+        await query.edit_message_text(
+            "📤 Upload subtitle\n\n"
+            "Please send your .srt or .vtt "
+            "subtitle file here.\n\n"
+            "After uploading it, you will get "
+            "the ▶️ Continue button."
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # CONTINUE
+    # -----------------------------------------------------
+
+    if data == "continue":
+
+        if not session.get("video"):
+
+            await query.edit_message_text(
+                "❌ Please select video quality first."
+            )
+            return
+
+        await query.edit_message_text(
+            "⏳ Processing started...\n\n"
+            "Please wait."
+        )
+
+        asyncio.create_task(
+            process_video(
+                query.message.chat_id,
+                context,
+                user_id
+            )
+        )
+
+        return
+
+
+# =========================================================
+# SUBTITLE MENU
+# =========================================================
+
+async def show_subtitles(
+    query,
+    session
+):
+
+    subtitles = session["subtitles"]
+
+    buttons = []
+
+    for subtitle in subtitles:
+
+        name = subtitle.get(
+            "name"
+        ) or "Subtitle"
+
+        language = subtitle.get(
+            "language"
+        )
+
+        if language:
+            name += f" ({language})"
+
+        buttons.append([
+            __import__(
+                "telegram"
+            ).InlineKeyboardButton(
+                f"💬 {name}",
+                callback_data=f"subtitle:{subtitle['id']}"
+            )
+        ])
+
+    buttons.append([
+        __import__(
+            "telegram"
+        ).InlineKeyboardButton(
+            "📤 Upload subtitle",
+            callback_data="upload_info"
+        )
+    ])
+
+    buttons.append([
+        __import__(
+            "telegram"
+        ).InlineKeyboardButton(
+            "⏭ Skip subtitle",
+            callback_data="subtitle_skip"
+        )
+    ])
+
+    await query.edit_message_text(
+        "💬 Select subtitle:",
+        reply_markup=__import__(
+            "telegram"
+        ).InlineKeyboardMarkup(buttons)
+    )
+
+
+# =========================================================
+# CONTINUE BUTTON
+# =========================================================
+
+async def show_continue(query):
+
+    keyboard = __import__(
+        "telegram"
+    ).InlineKeyboardMarkup([
+        [
+            __import__(
+                "telegram"
+            ).InlineKeyboardButton(
+                "▶️ Continue",
+                callback_data="continue"
+            )
+        ]
+    ])
+
+    await query.edit_message_text(
+        "✅ Selection complete.\n\n"
+        "Press ▶️ Continue to start.",
+        reply_markup=keyboard
+    )
+
+
+# =========================================================
+# SUBTITLE UPLOAD
+# =========================================================
+
+async def receive_subtitle(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    user_id = update.effective_user.id
+
+    session = sessions.get(user_id)
+
+    if not session:
+
+        await update.message.reply_text(
+            "❌ No active session.\n"
+            "Send an .m3u8 URL first."
+        )
+        return
+
+    document = update.message.document
+
+    if not document:
+        return
+
+    filename = document.file_name or ""
+
+    if not filename.lower().endswith(
+        (".srt", ".vtt")
+    ):
+
+        await update.message.reply_text(
+            "❌ Only .srt and .vtt files "
+            "are supported."
+        )
+        return
+
+    # Create working directory
+    if not session.get("workdir"):
+
+        session["workdir"] = tempfile.mkdtemp(
+            prefix="m3u8bot_"
+        )
+
+    workdir = Path(
+        session["workdir"]
+    )
+
+    subtitle_path = (
+        workdir / filename
+    )
+
+    telegram_file = await document.get_file()
+
+    await telegram_file.download_to_drive(
+        custom_path=str(subtitle_path)
+    )
+
+    session[
+        "uploaded_subtitle"
+    ] = str(subtitle_path)
+
+    # Clear selected remote subtitle
+    session["subtitle"] = None
+
+    keyboard = __import__(
+        "telegram"
+    ).InlineKeyboardMarkup([
+        [
+            __import__(
+                "telegram"
+            ).InlineKeyboardButton(
+                "▶️ Continue",
+                callback_data="continue"
+            )
+        ]
+    ])
+
+    await update.message.reply_text(
+        "✅ Subtitle uploaded successfully.\n\n"
+        "Press ▶️ Continue.",
+        reply_markup=keyboard
+    )
+
+
+# =========================================================
+# PROCESS VIDEO
+# =========================================================
+
+async def process_video(
+    chat_id,
+    context,
+    user_id
+):
+
+    session = sessions.get(user_id)
+
+    if not session:
+        return
+
+    async with processing_semaphore:
+
+        workdir = Path(
+            tempfile.mkdtemp(
+                prefix="m3u8bot_"
+            )
+        )
+
+        session["workdir"] = str(
+            workdir
+        )
+
+        video_file = (
+            workdir / "video.mp4"
+        )
+
+        audio_file = (
+            workdir / "audio.m4a"
+        )
+
+        subtitle_file = None
+
+        output_file = (
+            workdir / "final.mp4"
+        )
+
+        try:
+
+            # -------------------------------------------------
+            # VIDEO
+            # -------------------------------------------------
+
+            await context.bot.send_message(
+                chat_id,
+                "🎥 Downloading selected video..."
+            )
+
+            video = session["video"]
+
+            video_url = video["uri"]
+
+            await download_file(
+                video_url,
+                video_file
+            )
+
+            # -------------------------------------------------
+            # AUDIO
+            # -------------------------------------------------
+
+            audio = session.get(
+                "audio"
+            )
+
+            if audio and audio.get("uri"):
+
+                await context.bot.send_message(
+                    chat_id,
+                    "🔊 Downloading selected audio..."
+                )
+
+                await download_file(
+                    audio["uri"],
+                    audio_file
+                )
+
+            else:
+
+                audio_file = None
+
+            # -------------------------------------------------
+            # SUBTITLE
+            # -------------------------------------------------
+
+            uploaded_subtitle = session.get(
+                "uploaded_subtitle"
+            )
+
+            selected_subtitle = session.get(
+                "subtitle"
+            )
+
+            if uploaded_subtitle:
+
+                subtitle_file = Path(
+                    uploaded_subtitle
+                )
+
+            elif selected_subtitle:
+
+                subtitle_file = (
+                    workdir / "subtitle.vtt"
+                )
+
+                subtitle_url = (
+                    selected_subtitle["uri"]
+                )
+
+                if subtitle_url:
+
+                    await context.bot.send_message(
+                        chat_id,
+                        "💬 Downloading subtitle..."
+                    )
+
+                    await download_file(
+                        subtitle_url,
+                        subtitle_file
+                    )
+
+            # -------------------------------------------------
+            # MERGE
+            # -------------------------------------------------
+
+            await context.bot.send_message(
+                chat_id,
+                "🔧 Merging video + audio"
+                + (
+                    " + subtitle..."
+                    if subtitle_file
+                    else "..."
+                )
+            )
+
+            await merge_video_audio(
+                video_file=str(
+                    video_file
+                ),
+                audio_file=(
+                    str(audio_file)
+                    if audio_file
+                    else None
+                ),
+                output_file=str(
+                    output_file
+                ),
+                subtitle_file=(
+                    str(subtitle_file)
+                    if subtitle_file
+                    else None
+                )
+            )
+
+            # -------------------------------------------------
+            # FILE SIZE
+            # -------------------------------------------------
+
+            file_size = (
+                output_file.stat().st_size
+            )
+
+            size_gb = (
+                file_size /
+                (1024 ** 3)
+            )
+
+            await context.bot.send_message(
+                chat_id,
+                f"✅ Processing complete.\n"
+                f"📦 Size: {size_gb:.2f} GB"
+            )
+
+            # -------------------------------------------------
+            # TELEGRAM
+            # -------------------------------------------------
+
+            if file_size <= MAX_TELEGRAM_SIZE:
+
+                await context.bot.send_message(
+                    chat_id,
+                    "📤 Uploading to Telegram..."
+                )
+
+                with open(
+                    output_file,
+                    "rb"
+                ) as file:
+
+                    await context.bot.send_document(
+                        chat_id,
+                        document=file,
+                        caption=(
+                            "🎬 MP4 Ready\n\n"
+                            f"📦 {size_gb:.2f} GB"
+                        )
+                    )
+
+            # -------------------------------------------------
+            # GOFILE
+            # -------------------------------------------------
+
+            else:
+
+                await context.bot.send_message(
+                    chat_id,
+                    "☁️ File is larger than "
+                    "1.94 GB.\n\n"
+                    "Uploading to GoFile..."
+                )
+
+                download_url = (
+                    await upload_to_gofile(
+                        str(output_file)
+                    )
+                )
+
+                await context.bot.send_message(
+                    chat_id,
+                    "✅ Upload complete!\n\n"
+                    "🔗 Download:\n"
+                    f"{download_url}"
+                )
+
+        except Exception as error:
+
+            await context.bot.send_message(
+                chat_id,
+                "❌ Processing failed.\n\n"
+                f"{str(error)[:4000]}"
+            )
+
+        finally:
+
+            # Cleanup
+            shutil.rmtree(
+                workdir,
+                ignore_errors=True
+            )
+
+            sessions.pop(
+                user_id,
+                None
+            )
+
+
+# =========================================================
 # MAIN
-# ---------------------------------------------------------
+# =========================================================
 
 def main():
 
-    app = (
+    validate_config()
+
+    application = (
         Application
         .builder()
         .token(BOT_TOKEN)
         .build()
     )
 
-    app.add_handler(
-        CommandHandler("start", start)
+    # Commands
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start
+        )
     )
 
-    app.add_handler(
-        CallbackQueryHandler(callback)
+    application.add_handler(
+        CommandHandler(
+            "help",
+            help_command
+        )
     )
 
-    app.add_handler(
+    application.add_handler(
+        CommandHandler(
+            "cancel",
+            cancel
+        )
+    )
+
+    # Inline buttons
+    application.add_handler(
+        CallbackQueryHandler(
+            callback
+        )
+    )
+
+    # Subtitle files
+    application.add_handler(
         MessageHandler(
             filters.Document.ALL,
             receive_subtitle
         )
     )
 
-    app.add_handler(
+    # m3u8 URL
+    application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             receive_url
         )
     )
 
-    print("Bot started...")
+    print(
+        "🚀 M3U8 Telegram Bot started..."
+    )
 
-    app.run_polling()
+    application.run_polling(
+        drop_pending_updates=True
+    )
 
 
 if __name__ == "__main__":
