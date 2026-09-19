@@ -1232,7 +1232,15 @@ async def error_handler(
         repr(context.error)
     )
 
-async def health_handler(request):
+
+# =========================================================
+# HEALTH CHECK SERVER
+# =========================================================
+
+async def health_handler(
+    request
+):
+
     return web.Response(
         text="OK",
         status=200
@@ -1240,6 +1248,7 @@ async def health_handler(request):
 
 
 async def start_health_server():
+
     app = web.Application()
 
     app.router.add_get(
@@ -1252,7 +1261,9 @@ async def start_health_server():
         health_handler
     )
 
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(
+        app
+    )
 
     await runner.setup()
 
@@ -1270,11 +1281,12 @@ async def start_health_server():
 
     return runner
 
+
 # =========================================================
-# MAIN
+# TELEGRAM BOT
 # =========================================================
 
-def main():
+async def run_bot():
 
     validate_config()
 
@@ -1284,6 +1296,7 @@ def main():
         .token(BOT_TOKEN)
         .build()
     )
+
 
     # =====================================================
     # COMMANDS
@@ -1310,6 +1323,7 @@ def main():
         )
     )
 
+
     # =====================================================
     # INLINE BUTTONS
     # =====================================================
@@ -1319,6 +1333,7 @@ def main():
             callback
         )
     )
+
 
     # =====================================================
     # SUBTITLE FILES
@@ -1331,6 +1346,7 @@ def main():
         )
     )
 
+
     # =====================================================
     # M3U8 URL
     # =====================================================
@@ -1342,6 +1358,7 @@ def main():
         )
     )
 
+
     # =====================================================
     # ERROR HANDLER
     # =====================================================
@@ -1350,29 +1367,47 @@ def main():
         error_handler
     )
 
+
+    # =====================================================
+    # START TELEGRAM APPLICATION
+    # =====================================================
+
+    await application.initialize()
+
+    await application.start()
+
+    await application.updater.start_polling(
+        drop_pending_updates=True
+    )
+
     print(
         "🚀 M3U8 Telegram Bot started..."
     )
 
-    application.run_polling(
-        drop_pending_updates=True
-    )
+
+    # =====================================================
+    # KEEP BOT RUNNING
+    # =====================================================
+
+    await asyncio.Event().wait()
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+async def main():
+
+    # Start Koyeb health server
+    await start_health_server()
+
+    # Start Telegram bot
+    await run_bot()
 
 
 # =========================================================
 # ENTRY POINT
 # =========================================================
-
-    # Keep bot alive
-    await asyncio.Event().wait()
-
-
-async def main():
-
-    await start_health_server()
-
-    await run_bot()
-
 
 if __name__ == "__main__":
 
