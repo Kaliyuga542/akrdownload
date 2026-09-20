@@ -1,4 +1,5 @@
 import asyncio
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -24,6 +25,7 @@ from telegram.ext import (
 from config import (
     BOT_TOKEN,
     MAX_TELEGRAM_SIZE,
+    MAX_CONCURRENT_JOBS,
     validate_config,
 )
 
@@ -32,6 +34,11 @@ from bot.dash import analyse as analyse_dash
 from bot.handlers import receive_cookie_file
 from bot.uploader import upload_to_gofile
 from bot.processor import merge_video_audio
+from bot.cookie_manager import cookie_path
+from bot.http_headers import (
+    build_headers,
+    headers_to_ffmpeg_format,
+)
 
 
 # =========================================================
@@ -40,7 +47,9 @@ from bot.processor import merge_video_audio
 
 sessions = {}
 
-processing_semaphore = asyncio.Semaphore(2)
+processing_semaphore = asyncio.Semaphore(
+    MAX_CONCURRENT_JOBS
+)
 
 
 # =========================================================
@@ -83,7 +92,10 @@ async def help_command(
         "5️⃣ Press Continue\n"
         "6️⃣ Bot creates MP4\n\n"
         "📦 ≤ 1.94 GB → Telegram\n"
-        "☁️ > 1.94 GB → GoFile"
+        "☁️ > 1.94 GB → GoFile\n\n"
+        "🍪 If you get 403 error:\n"
+        "Upload your cookies file, then "
+        "send the URL again."
     )
 
 
@@ -127,7 +139,8 @@ async def cancel(
 
 async def download_file(
     url: str,
-    destination: Path
+    destination: Path,
+    headers=None
 ):
 
     timeout = aiohttp.ClientTimeout(
@@ -136,7 +149,8 @@ async def download_file(
     )
 
     async with aiohttp.ClientSession(
-        timeout=timeout
+        timeout=timeout,
+        headers=headers or {}
     ) as session:
 
         async with session.get(
@@ -176,7 +190,8 @@ async def download_file(
 async def download_media(
     url: str,
     destination: Path,
-    media_type: str
+    media_type: str,
+    headers=None
 ):
 
     if media_type == "video":
@@ -184,17 +199,6 @@ async def download_media(
         command = [
             "ffmpeg",
             "-y",
-
-            "-i",
-            url,
-
-            "-map",
-            "0:v:0",
-
-            "-c:v",
-            "copy",
-
-            str(destination)
         ]
 
     elif media_type == "audio":
@@ -202,19 +206,6 @@ async def download_media(
         command = [
             "ffmpeg",
             "-y",
-
-            "-i",
-            url,
-
-            "-map",
-            "0:a:0",
-
-            "-vn",
-
-            "-c:a",
-            "copy",
-
-            str(destination)
         ]
 
     else:
@@ -222,6 +213,46 @@ async def download_media(
         raise ValueError(
             f"Unsupported media type: {media_type}"
         )
+
+    # ----------------------------------------------------
+    # HEADERS + COOKIES (403 FIX)
+    # ----------------------------------------------------
+
+    header_str = headers_to_ffmpeg_format(
+        headers or {}
+    )
+
+    if header_str:
+
+        command.extend([
+            "-headers",
+            header_str
+        ])
+
+    if media_type == "video":
+
+        command.extend([
+            "-i",
+            url,
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "copy",
+            str(destination)
+        ])
+
+    else:
+
+        command.extend([
+            "-i",
+            url,
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-c:a",
+            "copy",
+            str(destination)
+        ])
 
     print(
         "Running FFmpeg:",
@@ -258,6 +289,134 @@ async def download_media(
         raise RuntimeError(
             "Downloaded media file is empty."
         )
+
+
+# =========================================================
+# HLS SUBTITLE PLAYLIST → WEBVTT EXTRACTION
+# =========================================================
+
+async def extract_webvtt(
+    subtitle_url: str,
+    output_path: Path,
+    headers=None
+):
+
+    command = [
+        "ffmpeg",
+        "-y",
+    ]
+
+    header_str = headers_to_ffmpeg_format(
+        headers or {}
+    )
+
+    if header_str:
+
+        command.extend([
+            "-headers",
+            header_str
+        ])
+
+    command.extend([
+        "-i",
+        subtitle_url,
+        "-map",
+        "0:s:0",
+        "-f",
+        "webvtt",
+        str(output_path)
+    ])
+
+    print(
+        "Extracting WebVTT:",
+        " ".join(command)
+    )
+
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    stdout, stderr = await process.communicate()
+
+    if process.returncode != 0:
+
+        error = stderr.decode(
+            errors="ignore"
+        )
+
+        raise RuntimeError(
+            "Subtitle extraction failed:\n"
+            + error[-3000:]
+        )
+
+    if (
+        not output_path.exists()
+        or output_path.stat().st_size == 0
+    ):
+
+        raise RuntimeError(
+            "Subtitle extraction produced "
+            "an empty file."
+        )
+
+
+# =========================================================
+# DISK SPACE CHECK
+# =========================================================
+
+def check_disk_space(
+    min_gb: float = 2.0
+) -> float:
+
+    free_gb = (
+        shutil.disk_usage("/tmp").free
+        / (1024 ** 3)
+    )
+
+    return free_gb
+
+
+# =========================================================
+# KEEPALIVE PROGRESS MESSAGES
+# =========================================================
+
+async def keepalive_messages(
+    bot,
+    chat_id,
+    stop_event: asyncio.Event
+):
+
+    try:
+
+        while not stop_event.is_set():
+
+            try:
+
+                await asyncio.wait_for(
+                    stop_event.wait(),
+                    timeout=60
+                )
+
+            except asyncio.TimeoutError:
+                pass
+
+            if stop_event.is_set():
+                break
+
+            try:
+
+                await bot.send_message(
+                    chat_id,
+                    "⏳ Still working, please wait..."
+                )
+
+            except Exception:
+                pass
+
+    except Exception:
+        pass
 
 
 # =========================================================
@@ -307,6 +466,20 @@ async def receive_url(
             ignore_errors=True
         )
 
+    # ----------------------------------------------------
+    # BUILD HEADERS + COOKIES (403 FIX)
+    # ----------------------------------------------------
+
+    cpath = cookie_path(user_id)
+
+    if cpath.exists():
+
+        headers = build_headers(cpath)
+
+    else:
+
+        headers = build_headers(None)
+
     status = await update.message.reply_text(
         "🔍 Analysing playlist..."
     )
@@ -322,7 +495,10 @@ async def receive_url(
             playlist_type = "hls"
 
             videos, audios, subtitles = (
-                await analyse_hls(url)
+                await analyse_hls(
+                    url,
+                    headers=headers
+                )
             )
 
             status_text = (
@@ -338,7 +514,10 @@ async def receive_url(
             playlist_type = "dash"
 
             videos, audios, subtitles = (
-                await analyse_dash(url)
+                await analyse_dash(
+                    url,
+                    headers=headers
+                )
             )
 
             status_text = (
@@ -359,6 +538,8 @@ async def receive_url(
             "url": url,
 
             "playlist_type": playlist_type,
+
+            "headers": headers,
 
             "videos": videos,
 
@@ -428,8 +609,11 @@ async def receive_url(
         )
 
     except Exception as error:
+
         error_text = str(error)
+
         if "403" in error_text or "Forbidden" in error_text:
+
             keyboard = [
                 [
                     InlineKeyboardButton(
@@ -444,15 +628,16 @@ async def receive_url(
                     )
                 ]
             ]
-            
+
             await status.edit_text(
                 "❌ Playlist access denied (403).\n\n"
-                "🍪 Upload an authorized cookie file to continue.",
+                "🍪 Upload an authorized cookie file, "
+                "then send the URL again.",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
-        
+
         else:
-            
+
             await status.edit_text(
                 "❌ Playlist analysis failed.\n\n"
                 f"{error_text[:3000]}"
@@ -488,19 +673,34 @@ async def callback(
         return
 
     data = query.data
-    
+
     if data == "upload_cookies":
+
         await query.answer()
-        
+
         await query.message.reply_text(
             "🍪 Please send your authorized cookie file.\n\n"
             "Supported:\n"
             "• .txt\n"
             "• .cookies\n"
-            "• .json"
+            "• .json\n\n"
+            "After uploading, send the URL again."
         )
+
         return
 
+    if data == "cancel_analysis":
+
+        sessions.pop(
+            user_id,
+            None
+        )
+
+        await query.edit_message_text(
+            "❌ Cancelled."
+        )
+
+        return
 
     # =====================================================
     # VIDEO
@@ -585,7 +785,6 @@ async def callback(
 
         return
 
-
     # =====================================================
     # AUDIO
     # =====================================================
@@ -628,7 +827,6 @@ async def callback(
         )
 
         return
-
 
     # =====================================================
     # SUBTITLE
@@ -685,7 +883,6 @@ async def callback(
 
         return
 
-
     # =====================================================
     # SKIP SUBTITLE
     # =====================================================
@@ -702,7 +899,6 @@ async def callback(
 
         return
 
-
     # =====================================================
     # UPLOAD SUBTITLE
     # =====================================================
@@ -715,7 +911,6 @@ async def callback(
         )
 
         return
-
 
     # =====================================================
     # CONTINUE
@@ -976,6 +1171,28 @@ async def process_video(
 
     async with processing_semaphore:
 
+        # ------------------------------------------------
+        # DISK SPACE CHECK
+        # ------------------------------------------------
+
+        free_gb = check_disk_space()
+
+        if free_gb < 2.0:
+
+            await context.bot.send_message(
+                chat_id,
+                "❌ Not enough disk space on server "
+                f"({free_gb:.1f} GB free).\n"
+                "Please try again later."
+            )
+
+            sessions.pop(
+                user_id,
+                None
+            )
+
+            return
+
         existing_workdir = session.get(
             "workdir"
         )
@@ -1016,6 +1233,28 @@ async def process_video(
         )
 
         subtitle_file = None
+
+        # ------------------------------------------------
+        # HEADERS FROM SESSION (403 FIX)
+        # ------------------------------------------------
+
+        headers = session.get(
+            "headers"
+        ) or {}
+
+        # ------------------------------------------------
+        # KEEPALIVE TASK
+        # ------------------------------------------------
+
+        stop_event = asyncio.Event()
+
+        keepalive_task = asyncio.create_task(
+            keepalive_messages(
+                context.bot,
+                chat_id,
+                stop_event
+            )
+        )
 
         try:
 
@@ -1061,7 +1300,8 @@ async def process_video(
                 await download_media(
                     video_url,
                     video_file,
-                    "video"
+                    "video",
+                    headers=headers
                 )
 
             elif playlist_type == "dash":
@@ -1069,7 +1309,8 @@ async def process_video(
                 await download_media(
                     video_url,
                     video_file,
-                    "video"
+                    "video",
+                    headers=headers
                 )
 
             else:
@@ -1077,7 +1318,6 @@ async def process_video(
                 raise RuntimeError(
                     "Unknown playlist type."
                 )
-
 
             # =================================================
             # AUDIO
@@ -1101,13 +1341,13 @@ async def process_video(
                 await download_media(
                     audio_url,
                     audio_file,
-                    "audio"
+                    "audio",
+                    headers=headers
                 )
 
             else:
 
                 audio_file = None
-
 
             # =================================================
             # SUBTITLE
@@ -1153,9 +1393,38 @@ async def process_video(
 
                     await download_file(
                         subtitle_url,
-                        subtitle_file
+                        subtitle_file,
+                        headers=headers
                     )
 
+                    # =========================================
+                    # HLS SUBTITLE PLAYLIST DETECTION (FIX)
+                    # =========================================
+
+                    try:
+
+                        head = subtitle_file.read_text(
+                            encoding="utf-8",
+                            errors="ignore"
+                        )[:64]
+
+                    except Exception:
+
+                        head = ""
+
+                    if head.startswith("#EXTM3U"):
+
+                        await context.bot.send_message(
+                            chat_id,
+                            "💬 Subtitle is a playlist. "
+                            "Extracting WebVTT..."
+                        )
+
+                        await extract_webvtt(
+                            subtitle_url,
+                            subtitle_file,
+                            headers=headers
+                        )
 
             # =================================================
             # MERGE
@@ -1194,7 +1463,6 @@ async def process_video(
                 )
             )
 
-
             # =================================================
             # VERIFY
             # =================================================
@@ -1220,12 +1488,14 @@ async def process_video(
                 (1024 ** 3)
             )
 
+            # Stop keepalive before upload messages
+            stop_event.set()
+
             await context.bot.send_message(
                 chat_id,
                 "✅ Processing complete.\n"
                 f"📦 Size: {size_gb:.2f} GB"
             )
-
 
             # =================================================
             # TELEGRAM
@@ -1251,7 +1521,6 @@ async def process_video(
                             f"📦 {size_gb:.2f} GB"
                         )
                     )
-
 
             # =================================================
             # GOFILE
@@ -1299,6 +1568,10 @@ async def process_video(
                 pass
 
         finally:
+
+            stop_event.set()
+
+            keepalive_task.cancel()
 
             shutil.rmtree(
                 workdir,
@@ -1354,6 +1627,14 @@ async def start_health_server():
         health_handler
     )
 
+    # Respect Koyeb PORT env variable
+    port = int(
+        os.getenv(
+            "PORT",
+            "8000"
+        )
+    )
+
     runner = web.AppRunner(
         app
     )
@@ -1363,35 +1644,67 @@ async def start_health_server():
     site = web.TCPSite(
         runner,
         "0.0.0.0",
-        8000
+        port
     )
 
     await site.start()
 
     print(
-        "❤️ Health server running on port 8000"
+        f"❤️ Health server running on port {port}"
     )
 
     return runner
 
 
 # =========================================================
-# TELEGRAM BOT
+# DOCUMENT ROUTER (SUBTITLE / COOKIE)
 # =========================================================
+
 async def receive_document(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-    document = update.message.document
 
-    filename = (document.file_name or "").lower()
+    if not update.message:
 
-    if filename.endswith((".srt", ".vtt")):
-        await receive_subtitle(update, context)
         return
 
-    if filename.endswith((".txt", ".cookies", ".json")):
-        await receive_cookie_file(update, context)
+    document = update.message.document
+
+    if not document:
+
+        return
+
+    filename = (
+        document.file_name
+        or ""
+    ).lower()
+
+    if filename.endswith(
+        (
+            ".srt",
+            ".vtt"
+        )
+    ):
+        await receive_subtitle(
+            update,
+            context
+        )
+
+        return
+
+    if filename.endswith(
+        (
+            ".txt",
+            ".cookies",
+            ".json"
+        )
+    ):
+        await receive_cookie_file(
+            update,
+            context
+        )
+
         return
 
     await update.message.reply_text(
@@ -1399,7 +1712,12 @@ async def receive_document(
         "Subtitle: .srt / .vtt\n"
         "Cookie file: .txt / .cookies / .json"
     )
-    
+
+
+# =========================================================
+# TELEGRAM BOT
+# =========================================================
+
 async def run_bot():
 
     validate_config()
@@ -1410,9 +1728,11 @@ async def run_bot():
         .token(BOT_TOKEN)
         .build()
     )
+
     # =====================================================
     # COMMANDS
     # =====================================================
+
     application.add_handler(
         CommandHandler(
             "start",
@@ -1433,45 +1753,39 @@ async def run_bot():
             cancel
         )
     )
+
     # =====================================================
     # CALLBACKS
     # =====================================================
+
     application.add_handler(
         CallbackQueryHandler(
             callback
         )
     )
+
     # =====================================================
-    # SUBTITLE
+    # DOCUMENTS (single router - filter bug fixed)
     # =====================================================
+
     application.add_handler(
         MessageHandler(
-            filters.Document.FileExtension(
-                "srt|vtt"
-            ),
-            receive_subtitle
-        )
-    )        
-    # =====================================================
-    # COOKIES
-    # =====================================================
-    application.add_handler(
-        MessageHandler(
-            filters.Document.FileExtension(
-                "txt|cookies|json"
-            ),
-            receive_cookie_file
+            filters.Document.ALL,
+            receive_document
         )
     )
+
     # =====================================================
     # URL
     # =====================================================
+
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             receive_url
         )
     )
+
     # =====================================================
     # ERROR
     # =====================================================
@@ -1479,7 +1793,6 @@ async def run_bot():
     application.add_error_handler(
         error_handler
     )
-
 
     # =====================================================
     # START
