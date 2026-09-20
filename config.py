@@ -1,8 +1,17 @@
 import os
 
 
+# =========================================================
+# BOT TOKEN
+# =========================================================
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
+
+# =========================================================
+# MAX FILE SIZE FOR TELEGRAM UPLOAD
+# Default: 1.94 GB (Telegram bot API limit ~2 GB)
+# =========================================================
 
 MAX_TELEGRAM_SIZE = int(
     float(
@@ -14,31 +23,22 @@ MAX_TELEGRAM_SIZE = int(
 )
 
 
-TEMP_DIR = os.getenv(
-    "TEMP_DIR",
-    "/tmp/m3u8_bot"
-)
-
+# =========================================================
+# MAX CONCURRENT PROCESSING JOBS
+# Koyeb free tier: 1 recommended (CPU/disk limit)
+# =========================================================
 
 MAX_CONCURRENT_JOBS = int(
     os.getenv(
         "MAX_CONCURRENT_JOBS",
-        "2"
+        "1"
     )
 )
 
 
-FFMPEG_PATH = os.getenv(
-    "FFMPEG_PATH",
-    "ffmpeg"
-)
-
-
-GOFILE_API = os.getenv(
-    "GOFILE_API",
-    "https://api.gofile.io"
-)
-
+# =========================================================
+# VALIDATION
+# =========================================================
 
 def validate_config():
 
