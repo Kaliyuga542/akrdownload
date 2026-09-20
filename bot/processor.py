@@ -2,14 +2,71 @@ import asyncio
 from pathlib import Path
 
 
+# =========================================================
+# FFPROBE AUDIO CODEC CHECK
+# =========================================================
+
+async def get_audio_codec(
+    path: str
+) -> str:
+
+    """
+    Return first audio stream codec name.
+    Empty string if probe fails.
+    """
+
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=codec_name",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+
+    try:
+
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        stdout, stderr = await process.communicate()
+
+        if process.returncode != 0:
+
+            return ""
+
+        return stdout.decode(
+            errors="ignore"
+        ).strip().lower()
+
+    except Exception:
+
+        return ""
+
+
+# =========================================================
+# MERGE VIDEO + AUDIO + SUBTITLE
+# =========================================================
+
 async def merge_video_audio(
     video_file: str,
     audio_file: str | None,
     output_file: str,
     subtitle_file: str | None = None,
 ):
+
     """
     Merge video + audio + optional subtitle into MP4.
+
+    Audio already AAC → stream copy (fast).
+    Otherwise → re-encode to AAC 192k.
     """
 
     command = [
@@ -37,18 +94,46 @@ async def merge_video_audio(
     command.extend([
         "-map",
         "0:v:0",
+        "-c:v",
+        "copy",
     ])
 
     # Audio
     if audio_file:
-        command.extend([
-            "-map",
-            "1:a:0",
-        ])
+
+        audio_codec = await get_audio_codec(
+            audio_file
+        )
+
+        if audio_codec == "aac":
+
+            # Already AAC → fast copy
+            command.extend([
+                "-map",
+                "1:a:0",
+                "-c:a",
+                "copy",
+            ])
+
+        else:
+
+            # Re-encode for MP4 compatibility
+            command.extend([
+                "-map",
+                "1:a:0",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+            ])
+
     else:
+
         command.extend([
             "-map",
             "0:a?",
+            "-c:a",
+            "copy",
         ])
 
     # Subtitle
@@ -63,14 +148,14 @@ async def merge_video_audio(
             "mov_text",
         ])
 
-    # Codecs
+    # Muxing stability fix
     command.extend([
-        "-c:v",
-        "copy",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
+        "-max_muxing_queue_size",
+        "1024",
+    ])
+
+    # MP4 optimization
+    command.extend([
         "-movflags",
         "+faststart",
         str(output_file),
@@ -116,12 +201,17 @@ async def merge_video_audio(
     return result
 
 
+# =========================================================
+# BACKWARD-COMPATIBLE WRAPPER
+# =========================================================
+
 async def run_ffmpeg(
     video,
     audio,
     subtitle,
     output,
 ):
+
     """
     Backward-compatible FFmpeg wrapper.
     """
@@ -141,6 +231,10 @@ async def run_ffmpeg(
         ),
     )
 
+
+# =========================================================
+# SIZE HELPERS
+# =========================================================
 
 def get_file_size(path):
     """Return file size in bytes."""
