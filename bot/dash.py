@@ -7,7 +7,8 @@ from urllib.parse import urljoin
 # DASH MPD DOWNLOADER / ANALYSER
 # =========================================================
 
-async def get_mpd(url):
+async def get_mpd(url, headers=None):
+
     """
     Download an authorized/unprotected MPEG-DASH MPD.
     """
@@ -17,7 +18,8 @@ async def get_mpd(url):
     )
 
     async with aiohttp.ClientSession(
-        timeout=timeout
+        timeout=timeout,
+        headers=headers or {}
     ) as session:
 
         async with session.get(
@@ -379,7 +381,8 @@ def get_representation_id(
 # =========================================================
 
 async def analyse(
-    url
+    url,
+    headers=None
 ):
 
     """
@@ -397,8 +400,24 @@ async def analyse(
     """
 
     text = await get_mpd(
-        url
+        url,
+        headers
     )
+
+    # -------------------------------------------------
+    # DRM DETECTION
+    # -------------------------------------------------
+
+    if (
+        "ContentProtection" in text
+        or "cenc:default_KID" in text
+    ):
+
+        raise RuntimeError(
+            "🔒 DRM (Widevine) detected.\n\n"
+            "This stream is DRM protected and cannot be "
+            "downloaded without decryption keys."
+        )
 
     try:
 
